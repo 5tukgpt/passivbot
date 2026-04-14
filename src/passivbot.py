@@ -122,6 +122,24 @@ _TYPE_MARKER_RE = re.compile(r"0x([0-9a-fA-F]{4})", re.IGNORECASE)
 _LEADING_HEX4_RE = re.compile(r"^(?:0x)?([0-9a-fA-F]{4})", re.IGNORECASE)
 
 
+def _extract_fee_cost(fees) -> float:
+    """Extract total fee cost (in quote currency) from a FillEvent.fees field.
+
+    Exchange payloads vary: HL/ccxt returns a dict {'currency': 'USDC', 'cost': 0.026},
+    others return a list of such dicts. Returns 0.0 on any shape mismatch.
+    """
+    if fees is None:
+        return 0.0
+    try:
+        if isinstance(fees, dict):
+            return float(fees.get("cost") or 0.0)
+        if isinstance(fees, (list, tuple)):
+            return float(sum(float((f or {}).get("cost") or 0.0) for f in fees))
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0
+
+
 def _get_process_rss_bytes() -> Optional[int]:
     """Return current process RSS in bytes or None if unavailable."""
     try:
@@ -707,7 +725,8 @@ class Passivbot:
         self._health_orders_placed = 0
         self._health_orders_cancelled = 0
         self._health_fills = 0
-        self._health_pnl = 0.0  # sum of realized PnL from fills
+        self._health_pnl = 0.0  # sum of realized PnL from fills (gross, excl. fees)
+        self._health_fees = 0.0  # sum of fees paid across all fills
         self._health_errors = 0
         self._health_ws_reconnects = 0
         self._health_rate_limits = 0
@@ -840,10 +859,17 @@ class Passivbot:
         if abs(balance_raw - balance_snapped) > 1e-9:
             balance_str += f" (snap {balance_snapped:.2f})"
 
-        # Build fills string with PnL if fills > 0
+        # Build fills string with net PnL (gross - fees) if fills > 0
         if self._health_fills > 0:
-            pnl_sign = "+" if self._health_pnl >= 0 else ""
-            fills_str = f"fills={self._health_fills} (pnl={pnl_sign}{self._health_pnl:.2f})"
+            net_pnl = self._health_pnl - self._health_fees
+            net_sign = "+" if net_pnl >= 0 else ""
+            gross_sign = "+" if self._health_pnl >= 0 else ""
+            fills_str = (
+                f"fills={self._health_fills} "
+                f"(net={net_sign}{net_pnl:.2f} "
+                f"gross={gross_sign}{self._health_pnl:.2f} "
+                f"fees={self._health_fees:.2f})"
+            )
         else:
             fills_str = "fills=0"
 
@@ -3501,9 +3527,10 @@ class Passivbot:
         if not new_events:
             return
 
-        # Track fills and PnL for health summary
+        # Track fills, gross PnL, and fees for health summary
         self._health_fills += len(new_events)
         self._health_pnl += sum(ev.pnl for ev in new_events)
+        self._health_fees += sum(_extract_fee_cost(ev.fees) for ev in new_events)
 
         if len(new_events) > 20:
             # Truncate to summary
