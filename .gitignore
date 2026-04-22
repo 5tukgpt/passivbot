@@ -381,6 +381,7 @@ Cargo.lock
 /api-keys.json
 /caches
 /optimize_results
+/experiments
 
 # Git worktrees
 .worktrees/
