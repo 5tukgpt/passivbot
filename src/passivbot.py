@@ -733,6 +733,12 @@ class Passivbot:
         self._health_last_summary_ms = 0
         self._health_summary_interval_ms = 15 * 60 * 1000  # 15 minutes
 
+        # Rate-limit forensics — JSONL appender for temporary investigation of
+        # HL 429 escalation (~2-5/day in March → 90+/day mid-April 2026).
+        # Writes to logs/rate_limits.jsonl. Temporary instrumentation; remove
+        # once the root cause is understood.
+        self._rate_limit_log_path = Path("logs/rate_limits.jsonl")
+
         # Unstuck logging throttle
         self._unstuck_last_log_ms = 0
         self._unstuck_log_interval_ms = 5 * 60 * 1000  # 5 minutes
@@ -837,6 +843,27 @@ class Passivbot:
             return
         self._health_last_summary_ms = now_ms
         self._log_health_summary()
+
+    def _record_rate_limit(self, site: str, exc: Exception, **extra) -> None:
+        """Append a structured record per 429 for post-hoc analysis.
+
+        Temporary instrumentation — a JSONL line per rate-limit event, including
+        the call-site label and any extra fields the caller wants to attach
+        (symbol, endpoint, etc.). Non-throwing on any IO issue.
+        """
+        try:
+            record = {
+                "ts_ms": utc_ms(),
+                "site": site,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            record.update(extra)
+            self._rate_limit_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._rate_limit_log_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, default=str) + "\n")
+        except Exception:
+            # Never let forensics instrumentation crash the hot path.
+            pass
 
     def _log_health_summary(self) -> None:
         """Log a health summary with uptime and counters."""
@@ -1931,6 +1958,7 @@ class Passivbot:
             except RateLimitExceeded as e:
                 self._health_errors += 1
                 self._health_rate_limits += 1
+                self._record_rate_limit("execution_loop", e)
                 logging.warning("[rate] execution loop hit rate limit; backing off 5s...")
                 await self.restart_bot_on_too_many_errors()
                 await asyncio.sleep(5.0)
@@ -3461,8 +3489,9 @@ class Passivbot:
 
             return True
 
-        except RateLimitExceeded:
+        except RateLimitExceeded as e:
             self._health_rate_limits += 1
+            self._record_rate_limit("fills_fetch", e)
             logging.warning("[rate] hit rate limit while fetching fill events; retrying next cycle")
             return False
         except Exception as e:
@@ -3985,8 +4014,9 @@ class Passivbot:
                 await asyncio.sleep(1.5)
                 await self.update_positions_and_balance()
             return True
-        except RateLimitExceeded:
+        except RateLimitExceeded as e:
             self._health_rate_limits += 1
+            self._record_rate_limit("open_orders_fetch", e)
             logging.warning("[rate] hit rate limit while fetching open orders; retrying next cycle")
             return False
         except Exception as e:
@@ -5982,8 +6012,9 @@ class Passivbot:
                 if now - self.init_markets_last_update_ms > 1000 * 60 * 60:
                     try:
                         await self.init_markets(verbose=False)
-                    except RateLimitExceeded:
+                    except RateLimitExceeded as e:
                         self._health_rate_limits += 1
+                        self._record_rate_limit("init_markets", e)
                         logging.warning(
                             "[rate] hourly init_markets hit rate limit; will retry next cycle"
                         )

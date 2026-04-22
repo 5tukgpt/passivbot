@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
@@ -25,6 +26,17 @@ class PrefixFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         record.log_prefix = self.prefix
         return True
+
+
+class _MaxLevelFilter(logging.Filter):
+    """Block records at or above a given level — used to split stdout from stderr."""
+
+    def __init__(self, max_exclusive_level: int):
+        super().__init__()
+        self.max_level = max_exclusive_level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno < self.max_level
 
 
 _LOG_LEVEL_ALIASES = {
@@ -143,12 +155,24 @@ def configure_logging(
     prefix_filter = PrefixFilter(prefix or "") if prefix else None
 
     if stream:
-        stream_handler = logging.StreamHandler()
-        stream_handler.setFormatter(formatter)
-        stream_handler.setLevel(numeric_level)
+        # Split streams: INFO/DEBUG/TRACE → stdout, WARNING+ → stderr.
+        # launchd routes stdout to passivbot.log, stderr to passivbot_error.log,
+        # so this keeps the error log focused on real problems instead of
+        # a firehose of INFO chatter.
+        stdout_handler = logging.StreamHandler(sys.stdout)
+        stdout_handler.setFormatter(formatter)
+        stdout_handler.setLevel(numeric_level)
+        stdout_handler.addFilter(_MaxLevelFilter(logging.WARNING))
         if prefix_filter:
-            stream_handler.addFilter(prefix_filter)
-        handlers.append(stream_handler)
+            stdout_handler.addFilter(prefix_filter)
+        handlers.append(stdout_handler)
+
+        stderr_handler = logging.StreamHandler(sys.stderr)
+        stderr_handler.setFormatter(formatter)
+        stderr_handler.setLevel(max(numeric_level, logging.WARNING))
+        if prefix_filter:
+            stderr_handler.addFilter(prefix_filter)
+        handlers.append(stderr_handler)
 
     if log_file:
         path = Path(log_file).expanduser()

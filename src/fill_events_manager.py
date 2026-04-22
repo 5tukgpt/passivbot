@@ -797,12 +797,30 @@ class FillEventCache:
     def load(self) -> List[FillEvent]:
         files = sorted(self.root.glob("*.json"))
         events: List[FillEvent] = []
+        error_markers = 0
         for path in files:
             try:
                 with path.open("r", encoding="utf-8") as fh:
                     payload = json.load(fh) or []
             except Exception as exc:
                 logger.warning("[fills] cache load: failed to read %s (%s)", path, exc)
+                continue
+            # Error markers are stored as a dict wrapper (status=api_error);
+            # successful fetches are lists of fill dicts. Skip non-list payloads
+            # so we don't try to parse an error marker as a fill.
+            if not isinstance(payload, list):
+                if isinstance(payload, dict) and payload.get("status") == "api_error":
+                    error_markers += 1
+                    logger.debug(
+                        "[fills] cache load: %s is an api_error marker, skipping",
+                        path.name,
+                    )
+                else:
+                    logger.warning(
+                        "[fills] cache load: unexpected payload type in %s (%s)",
+                        path.name,
+                        type(payload).__name__,
+                    )
                 continue
             for raw in payload:
                 try:
@@ -811,12 +829,70 @@ class FillEventCache:
                     logger.debug("[fills] cache load: skipping malformed record in %s", path)
         events.sort(key=lambda ev: ev.timestamp)
         logger.info(
-            "[fills] cache loaded: %d events from %d files in %s",
+            "[fills] cache loaded: %d events from %d files in %s"
+            + (f" (+{error_markers} api_error markers)" if error_markers else ""),
             len(events),
             len(files),
             self.root,
         )
         return events
+
+    def write_error_markers_for_range(
+        self,
+        start_ms: Optional[int],
+        end_ms: Optional[int],
+        error: str,
+    ) -> int:
+        """Mark each UTC day in [start_ms, end_ms] with an api_error wrapper.
+
+        Only writes a marker if the day's file does not already exist — we never
+        overwrite successful cache data. A subsequent successful refresh will
+        clobber the marker atomically via save_days' os.replace.
+
+        Returns the number of marker files written.
+        """
+        if start_ms is None or end_ms is None:
+            return 0
+        start_dt = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).date()
+        end_dt = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).date()
+        if end_dt < start_dt:
+            return 0
+        written = 0
+        now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+        day = start_dt
+        while day <= end_dt:
+            key = day.strftime("%Y-%m-%d")
+            path = self.root / f"{key}.json"
+            day = day + timedelta(days=1)
+            if path.exists():
+                continue  # never clobber existing cache data
+            marker = {
+                "status": "api_error",
+                "error": error,
+                "timestamp_ms": now_ms,
+                "range_ms": [int(start_ms), int(end_ms)],
+            }
+            tmp = path.with_suffix(".tmp")
+            try:
+                with tmp.open("w", encoding="utf-8") as fh:
+                    json.dump(marker, fh)
+                os.replace(tmp, path)
+                written += 1
+            except Exception as exc:
+                logger.warning(
+                    "[fills] failed to write api_error marker for %s: %s",
+                    key,
+                    exc,
+                )
+        if written:
+            logger.warning(
+                "[fills] wrote %d api_error marker(s) for %s → %s (error=%s)",
+                written,
+                start_dt.isoformat(),
+                end_dt.isoformat(),
+                error,
+            )
+        return written
 
     def save(self, events: Sequence[FillEvent]) -> None:
         day_map: Dict[str, List[FillEvent]] = defaultdict(list)
@@ -2318,7 +2394,7 @@ class FillEventsManager:
 
         try:
             await self.fetcher.fetch(start_ms, end_ms, detail_cache, on_batch=handle_batch)
-        except RateLimitExceeded:
+        except RateLimitExceeded as exc:
             # Preserve bounded-range failures as known gaps so retry logic can
             # revisit them.  We still re-raise to fail loudly on critical input.
             if start_ms is not None and end_ms is not None:
@@ -2327,6 +2403,20 @@ class FillEventsManager:
                     end_ms,
                     reason=GAP_REASON_FETCH_FAILED,
                     confidence=GAP_CONFIDENCE_UNKNOWN,
+                )
+                # Drop an api_error marker on each otherwise-empty day so
+                # downstream consumers (fee_analysis, dashboards) can tell a
+                # no-trade day apart from a failed fetch.
+                self.cache.write_error_markers_for_range(
+                    start_ms, end_ms, f"RateLimitExceeded: {exc}"
+                )
+            raise
+        except Exception as exc:  # noqa: BLE001 — narrow-by-category below
+            # Any other fetch exception: same no-trade-vs-failed-fetch concern,
+            # but don't clobber real cache data (marker helper won't overwrite).
+            if start_ms is not None and end_ms is not None:
+                self.cache.write_error_markers_for_range(
+                    start_ms, end_ms, f"{type(exc).__name__}: {exc}"
                 )
             raise
 
