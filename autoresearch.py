@@ -152,6 +152,11 @@ def get_bounds_for_param(config: dict, json_path: str) -> tuple | None:
 # ── Git helpers ───────────────────────────────────────────────────────────────
 
 def git(args: list, cwd: Path = SCRIPT_DIR) -> subprocess.CompletedProcess:
+    # Operate on the trading-bots root repo (5tukgpt/trading-bots), not the
+    # upstream passivbot clone that lives inside it. The .parent resolution
+    # below is deliberate: passivbot/ has its own .git from the enarjord
+    # upstream, but commits here need to land in the parent monorepo so
+    # git-auto-push ships them.
     return subprocess.run(
         ['git'] + args,
         cwd=cwd.parent,  # trading-bots root
@@ -160,7 +165,21 @@ def git(args: list, cwd: Path = SCRIPT_DIR) -> subprocess.CompletedProcess:
     )
 
 
+# Set AUTORESEARCH_DRY_RUN=1 to print git ops instead of executing them.
+DRY_RUN = os.environ.get('AUTORESEARCH_DRY_RUN', '').lower() in ('1', 'true', 'yes')
+
+
+def _git_tracked_dirty(path_rel_from_parent: str) -> bool:
+    """Return True if the given path (relative to the parent repo root) has
+    uncommitted changes. Used to guard destructive ops."""
+    result = git(['status', '--porcelain', '--', path_rel_from_parent])
+    return bool(result.stdout.strip())
+
+
 def git_commit(message: str) -> bool:
+    if DRY_RUN:
+        logger.info(f"[DRY-RUN] git add + commit -m '{message[:80]}'")
+        return True
     git(['add', 'passivbot/configs/live/optimized.json'])
     result = git(['commit', '-m', message])
     if result.returncode != 0:
@@ -171,11 +190,30 @@ def git_commit(message: str) -> bool:
 
 
 def git_revert_last() -> bool:
-    result = git(['reset', 'HEAD~1', '--hard'])
+    """Non-destructive revert of the most recent autoresearch commit.
+
+    Uses `git revert --no-edit HEAD` so we create a new revert commit instead
+    of moving HEAD backwards with `--hard`. Important because `git()` operates
+    on the parent trading-bots repo — a hard reset would clobber unrelated
+    uncommitted work in that repo.
+
+    Guards: refuses to run if the parent repo has any uncommitted changes in
+    passivbot/configs/live/optimized.json (the only file autoresearch writes).
+    If the working tree around that file is dirty, something else is in flight
+    and we should not automate a revert on top of it.
+    """
+    if DRY_RUN:
+        logger.info("[DRY-RUN] git revert --no-edit HEAD")
+        return True
+    if _git_tracked_dirty('passivbot/configs/live/optimized.json'):
+        logger.error("refusing to revert: optimized.json has uncommitted changes. "
+                     "Commit or stash them first.")
+        return False
+    result = git(['revert', '--no-edit', 'HEAD'])
     if result.returncode != 0:
         logger.error(f"git revert failed: {result.stderr.strip()}")
         return False
-    logger.info("git revert: experiment discarded")
+    logger.info("git revert: experiment discarded (revert commit created)")
     return True
 
 
@@ -194,12 +232,13 @@ def run_backtest(config_path: Path) -> dict | None:
     venv_python = SCRIPT_DIR / 'venv' / 'bin' / 'python'
     python = str(venv_python) if venv_python.exists() else sys.executable
 
+    # v7 backtester is src/backtest.py, NOT src/passivbot.py with a 'backtest'
+    # subcommand. passivbot.py is the live bot and does not accept 'backtest'.
     cmd = [
-        python, str(SCRIPT_DIR / 'src' / 'passivbot.py'),
-        'backtest',
+        python, str(SCRIPT_DIR / 'src' / 'backtest.py'),
         str(config_path),
     ]
-    logger.info(f"Running backtest: {' '.join(cmd[-3:])}")
+    logger.info(f"Running backtest: {' '.join(cmd[-2:])}")
     result = subprocess.run(
         cmd,
         capture_output=True,
