@@ -5566,7 +5566,7 @@ class Passivbot:
             self.error_counts = []
         now = utc_ms()
         self.error_counts = [x for x in self.error_counts if x > now - 1000 * 60 * 60] + [now]
-        max_n_errors_per_hour = 10
+        max_n_errors_per_hour = 50
         logging.info(
             f"error count: {len(self.error_counts)} of {max_n_errors_per_hour} errors per hour"
         )
