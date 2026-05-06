@@ -908,7 +908,7 @@ class Passivbot:
         error_counts = getattr(self, "error_counts", [])
         now = utc_ms()
         recent_errors = len([x for x in error_counts if x > now - 1000 * 60 * 60])
-        max_errors = 10
+        max_errors = 50
         error_budget_str = f"{recent_errors}/{max_errors}"
 
         # Memory usage
