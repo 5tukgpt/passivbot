@@ -376,7 +376,10 @@ Cargo.lock
 /backtests
 /historical_data
 /results*
-/configs
+/configs/*
+!/configs/live/
+/configs/live/*
+!/configs/live/optimized.json
 /reports
 /api-keys.json
 /caches
