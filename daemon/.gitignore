@@ -1,0 +1,8 @@
+# SQLite DB is a regenerable output, not source. Re-create via persist_results.py.
+config_optimizer.db
+config_optimizer.db-journal
+config_optimizer.db-wal
+config_optimizer.db-shm
+
+# Per-run log files from daemon_run.py.
+logs/
