@@ -2,13 +2,15 @@
 
 Grid-trading bot running on Hyperliquid perps. Rust computes orders; Python orchestrates exchange I/O. This file is your project context — read it plus `AGENTS.md` before doing anything non-trivial.
 
-## Current status (as of 2026-05-02)
+## Current status (as of 2026-05-11)
 
 - **Exchange:** Hyperliquid. Stake currency USDC.
 - **Mode:** Live (paper-equivalent via small capital). `balance_override: 1108.0` in `configs/live/optimized.json`.
+- **Live equity:** ~$1,233 (as of 2026-05-10)
 - **Approved coins (14):** BTC, ETH, SOL, HYPE, XRP, NEAR, SUI, AAVE, DOGE, AVAX, LINK, ARB, WLD, ENA. Configured in `configs/approved_coins.json` and referenced by `configs/live/optimized.json`.
 - **Leverage:** 10×.
 - **Supervision:** launchd plist (see `../plists/`). Same stop/start discipline as gooner_bot — unload before kill.
+- **Drawdown circuit breaker:** `com.tradingbots.dd-circuit-breaker` runs `scripts/dd_circuit_breaker.py` hourly. Fires at -20% from rolling peak: sets `bot.long.entry_initial_qty_pct=0` and freezes `total_wallet_exposure_limit` to current TWE in `configs/live/optimized.json`. Open positions are NOT closed; unstuck logic still runs. Manual re-enable required: `python3 scripts/dd_circuit_reset.py`. State at `data/dd_circuit_state.json`. Reads cached daily metrics (no normal-path HL API calls). This is a *Tier-3 exception* — the breaker is authorized to autonomously edit the live config per T3-001.
 
 ## Domain concepts
 
