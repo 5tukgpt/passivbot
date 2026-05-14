@@ -1,31 +1,43 @@
 #!/usr/bin/env python3
 """
-Drawdown Circuit Breaker for live Passivbot (T3-001).
+Drawdown Circuit Breaker for live Passivbot (T3-001, revised 2026-05-14).
 
 WHAT THIS DOES — and why it's a TIER-3 EXCEPTION:
 
-This script is authorized to autonomously modify the LIVE Passivbot config
-(configs/live/optimized.json) when an account-level drawdown threshold is
-breached. That is normally a Tier-3 action requiring James's approval.
-This script IS the approval: James approved T3-001 explicitly so the
+This script is authorized to autonomously stop the LIVE Passivbot when an
+account-level drawdown threshold is breached. That is normally a Tier-3
+action requiring James's approval. This script IS the approval: James
+approved T3-001 (and the 2026-05-14 kill_switch revision) explicitly so the
 breaker can self-fire without a human in the loop. See
 orchestrator.db.tier3_items T3-001.
 
-Fire condition:    account_value drops >= 20% below the rolling peak.
-Fire actions:      1) bot.long.entry_initial_qty_pct = 0 (pause new entries)
-                   2) bot.long.total_wallet_exposure_limit = current TWE
-                                                   (freeze exposure ceiling)
-                   3) Telegram alert (manual re-enable required)
-                   4) Mark state.fired_at — script will NOT fire again
-                      until dd_circuit_reset.py is run.
+Fire condition: account_value drops >= 20% below the rolling peak.
 
-OPEN POSITIONS ARE NOT CLOSED. Unstuck logic still runs. The breaker is
-account-level catastrophe protection, not micromanagement.
+Fire-action MODES (configurable via DD_FIRE_MODE env var or --fire-mode):
+
+  kill_switch (default, 2026-05-14):
+    1) launchctl unload com.tradingbots.passivbot.plist  (stop new orders)
+    2) ccxt cancel_all_orders                            (clear the book)
+    3) market-close each open position with reduceOnly,  (flatten exposure)
+       3 retries with exponential backoff per position
+    4) fetch_positions again to verify all flat
+    5) Telegram alert with per-position results
+    6) Mark state.fired_at — script will NOT fire again until reset.
+
+  pause_freeze (legacy T3-001 original):
+    1) bot.long.entry_initial_qty_pct = 0  (pause new entries)
+    2) bot.long.total_wallet_exposure_limit = current TWE (freeze ceiling)
+    3) Telegram alert
+    4) Mark state.fired_at.
+    OPEN POSITIONS ARE NOT CLOSED. Unstuck logic still runs.
 
 Data source: passivbot/logs/hl_daily_metrics.json (refreshed daily 00:05 UTC
 by com.tradingbots.passivbot-metrics). The breaker does NOT poll HL on the
-normal path — only ONE HL call is made, ONLY at fire-time, to fetch current
-positions for TWE calculation.
+normal path. HL API calls happen only on fire (kill_switch: many; pause_freeze:
+one read-only for TWE calc).
+
+Telegram creds: prefer TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID env vars; otherwise
+read from <trading-bots-root>/.telegram-bot-token and .telegram-chat-id files.
 
 Manual re-enable: python3 scripts/dd_circuit_reset.py
 """
@@ -35,6 +47,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -45,13 +58,26 @@ from pathlib import Path
 from typing import Any
 
 REPO = Path(__file__).resolve().parent.parent
+TRADING_BOTS_ROOT = REPO.parent
 METRICS_JSON = REPO / "logs" / "hl_daily_metrics.json"
 LIVE_CONFIG = REPO / "configs" / "live" / "optimized.json"
 STATE_PATH = REPO / "data" / "dd_circuit_state.json"
 API_KEYS_PATH = REPO / "api-keys.json"
+LIVE_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / "com.tradingbots.passivbot.plist"
+PLIST_LABEL = "com.tradingbots.passivbot"
 
 DD_THRESHOLD = 0.20  # fire at >= 20% drawdown from peak
 INFO_URL = "https://api.hyperliquid.xyz/info"
+
+# Fire-action modes. `kill_switch` is the new default (T3-001 revised 2026-05-14):
+# unload Passivbot plist, cancel all orders, market-close all positions.
+# `pause_freeze` is the original T3-001 behavior: set entry_initial_qty_pct=0
+# and freeze TWEL — leaves positions open, no plist unload.
+DEFAULT_FIRE_MODE = "kill_switch"
+ALLOWED_FIRE_MODES = ("kill_switch", "pause_freeze")
+KILL_CLOSE_MAX_RETRIES = 3
+KILL_CLOSE_INITIAL_BACKOFF_S = 5.0
+KILL_POST_UNLOAD_WAIT_S = 5.0
 
 
 # --------------------------------------------------------------------------
@@ -254,11 +280,36 @@ def modify_live_config(
     return {"before": before, "after": after}
 
 
+def _load_telegram_creds() -> tuple[str, str]:
+    """Return (token, chat_id). Prefer env vars; fall back to .telegram-*
+    files at the trading-bots repo root (already gitignored)."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "") or ""
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "") or ""
+    if not token:
+        f = TRADING_BOTS_ROOT / ".telegram-bot-token"
+        if f.exists():
+            try:
+                token = f.read_text().strip()
+            except OSError:
+                pass
+    if not chat_id:
+        f = TRADING_BOTS_ROOT / ".telegram-chat-id"
+        if f.exists():
+            try:
+                chat_id = f.read_text().strip()
+            except OSError:
+                pass
+    return token, chat_id
+
+
 def send_telegram(message: str) -> bool:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    token, chat_id = _load_telegram_creds()
     if not token or not chat_id:
-        print("WARN: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set; skipping alert", file=sys.stderr)
+        print(
+            "WARN: telegram creds not found in env or "
+            f"{TRADING_BOTS_ROOT}/.telegram-{{bot-token,chat-id}}; skipping alert",
+            file=sys.stderr,
+        )
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = urllib.parse.urlencode({
@@ -322,6 +373,294 @@ def format_alert(
 
 
 # --------------------------------------------------------------------------
+# Kill-switch fire mode (T3-001 revised 2026-05-14): unload plist, cancel
+# orders, market-close positions. Uses ccxt (vendored in passivbot venv) so
+# no new dependency. Order matters — unload FIRST stops the bot from
+# re-entering while we close, which would cause flapping + 429s.
+# --------------------------------------------------------------------------
+def resolve_fire_mode(cli_override: str | None = None) -> str:
+    raw = cli_override or os.environ.get("DD_FIRE_MODE") or DEFAULT_FIRE_MODE
+    mode = raw.strip().lower()
+    if mode not in ALLOWED_FIRE_MODES:
+        print(
+            f"WARN: invalid fire mode {raw!r}; allowed={ALLOWED_FIRE_MODES}; "
+            f"falling back to {DEFAULT_FIRE_MODE!r}",
+            file=sys.stderr,
+        )
+        return DEFAULT_FIRE_MODE
+    return mode
+
+
+def _load_hl_creds(api_keys_path: Path) -> dict | None:
+    if not api_keys_path.exists():
+        return None
+    try:
+        keys = json.loads(api_keys_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    creds = keys.get("hyperliquid_live") or {}
+    if not creds.get("wallet_address") or not creds.get("private_key"):
+        return None
+    return creds
+
+
+def _close_position_with_retry(
+    exchange: Any,
+    position: dict,
+    max_retries: int,
+    initial_backoff: float,
+) -> dict:
+    """Market-close ONE position with reduceOnly. Returns a result dict.
+
+    Retries only on exception. On structural failure (e.g., below-min notional)
+    ccxt raises, we capture the message and report — operator decides.
+    """
+    coin = position.get("symbol") or position.get("info", {}).get("coin") or "?"
+    side = position.get("side")
+    size_raw = position.get("contracts")
+    if size_raw is None:
+        size_raw = position.get("info", {}).get("szi", 0)
+    try:
+        size = abs(float(size_raw or 0))
+    except (TypeError, ValueError):
+        size = 0.0
+
+    if size == 0:
+        return {"coin": coin, "ok": True, "attempts": 0,
+                "error": None, "fill_price": None, "note": "already flat"}
+
+    # Close = opposite side
+    close_side = "sell" if side == "long" else "buy"
+
+    last_err: str | None = None
+    backoff = initial_backoff
+    for attempt in range(1, max_retries + 1):
+        try:
+            order = exchange.create_market_order(
+                coin, close_side, size,
+                params={"reduceOnly": True},
+            )
+            return {
+                "coin": coin, "ok": True, "attempts": attempt,
+                "error": None,
+                "fill_price": order.get("average") or order.get("price"),
+            }
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"[:300]
+            print(
+                f"close attempt {attempt}/{max_retries} for {coin} failed: {last_err}",
+                file=sys.stderr,
+            )
+            if attempt < max_retries:
+                time.sleep(backoff)
+                backoff *= 3
+    return {"coin": coin, "ok": False, "attempts": max_retries,
+            "error": last_err, "fill_price": None}
+
+
+def kill_switch_fire(
+    api_keys_path: Path = API_KEYS_PATH,
+    plist_path: Path = LIVE_PLIST_PATH,
+    plist_label: str = PLIST_LABEL,
+    max_retries: int = KILL_CLOSE_MAX_RETRIES,
+    initial_backoff: float = KILL_CLOSE_INITIAL_BACKOFF_S,
+    post_unload_wait: float = KILL_POST_UNLOAD_WAIT_S,
+) -> dict:
+    """Execute the kill-switch sequence and return a structured result.
+
+    Sequence:
+      1. launchctl unload <plist>            (stop bot from placing new orders)
+      2. sleep ~5s for clean exit
+      3. ccxt cancel_all_orders              (clear the book)
+      4. ccxt fetch_positions                (snapshot what to close)
+      5. for each open position: market-close with reduceOnly, retry on error
+      6. ccxt fetch_positions again          (verify all flat)
+    """
+    start = time.time()
+    result: dict = {
+        "fire_mode": "kill_switch",
+        "unload": {"ok": False, "stderr": "", "skipped": False},
+        "cancel_orders": {"ok": False, "error": None, "skipped": False},
+        "positions_at_fire": [],
+        "close_results": [],
+        "all_flat": False,
+        "duration_s": 0.0,
+        "fatal": None,
+    }
+
+    # ---- Step 1: unload plist ------------------------------------------------
+    if plist_path.exists():
+        try:
+            r = subprocess.run(
+                ["launchctl", "unload", str(plist_path)],
+                capture_output=True, text=True, timeout=15,
+            )
+            result["unload"] = {
+                "ok": r.returncode == 0,
+                "stderr": (r.stderr or "").strip()[:500],
+                "skipped": False,
+            }
+        except (subprocess.TimeoutExpired, OSError) as e:
+            result["unload"] = {"ok": False, "stderr": f"{type(e).__name__}: {e}"[:300],
+                                "skipped": False}
+    else:
+        result["unload"] = {"ok": False, "stderr": f"plist not at {plist_path}",
+                            "skipped": True}
+
+    # Brief pause for the bot process to exit cleanly before we mutate the book
+    time.sleep(post_unload_wait)
+
+    # ---- Step 2: load ccxt + creds -------------------------------------------
+    try:
+        import ccxt  # noqa: PLC0415 — lazy import; ccxt only needed on fire path
+    except ImportError as e:
+        result["fatal"] = f"ccxt import failed: {e}"
+        result["duration_s"] = time.time() - start
+        return result
+
+    creds = _load_hl_creds(api_keys_path)
+    if creds is None:
+        result["fatal"] = f"hyperliquid_live creds missing/invalid at {api_keys_path}"
+        result["duration_s"] = time.time() - start
+        return result
+
+    try:
+        exchange = ccxt.hyperliquid({
+            "walletAddress": creds["wallet_address"],
+            "privateKey": creds["private_key"],
+        })
+    except Exception as e:  # ccxt raises on bad creds, etc.
+        result["fatal"] = f"ccxt.hyperliquid init failed: {type(e).__name__}: {e}"[:300]
+        result["duration_s"] = time.time() - start
+        return result
+
+    # ---- Step 3: cancel all orders -------------------------------------------
+    try:
+        exchange.cancel_all_orders()
+        result["cancel_orders"]["ok"] = True
+    except Exception as e:
+        # Cancel failure isn't fatal — we still try to close positions, since
+        # market closes with reduceOnly will succeed even if resting orders
+        # collide (they'd just partially fill the close).
+        result["cancel_orders"]["error"] = f"{type(e).__name__}: {e}"[:300]
+
+    # ---- Step 4: fetch positions ---------------------------------------------
+    try:
+        positions = exchange.fetch_positions()
+    except Exception as e:
+        result["fatal"] = f"fetch_positions failed: {type(e).__name__}: {e}"[:300]
+        result["duration_s"] = time.time() - start
+        return result
+
+    def _open(p: dict) -> bool:
+        try:
+            return abs(float(p.get("contracts", 0) or 0)) > 0
+        except (TypeError, ValueError):
+            return False
+
+    open_positions = [p for p in positions if _open(p)]
+    result["positions_at_fire"] = [
+        {
+            "coin": p.get("symbol"),
+            "side": p.get("side"),
+            "size": p.get("contracts"),
+            "notional": p.get("notional"),
+            "upnl": p.get("unrealizedPnl"),
+        }
+        for p in open_positions
+    ]
+
+    # ---- Step 5: market-close each position ----------------------------------
+    for p in open_positions:
+        cr = _close_position_with_retry(exchange, p, max_retries, initial_backoff)
+        result["close_results"].append(cr)
+
+    # ---- Step 6: verify all flat ---------------------------------------------
+    try:
+        after = exchange.fetch_positions()
+        result["all_flat"] = not any(_open(p) for p in after)
+    except Exception as e:
+        # We can't verify, but the closes already ran. Mark unknown.
+        result["all_flat"] = False
+        result["verify_error"] = f"{type(e).__name__}: {e}"[:200]
+
+    result["duration_s"] = time.time() - start
+    return result
+
+
+def format_kill_switch_alert(
+    current_value: float,
+    peak: float,
+    dd_pct: float,
+    fire_result: dict,
+) -> str:
+    unload = fire_result.get("unload", {})
+    cancel = fire_result.get("cancel_orders", {})
+    fatal = fire_result.get("fatal")
+
+    if unload.get("skipped"):
+        unload_line = f"⚠️ Plist unload SKIPPED ({unload.get('stderr','')[:80]})"
+    elif unload.get("ok"):
+        unload_line = "✓ Plist unloaded"
+    else:
+        unload_line = f"✗ Plist unload FAILED: {unload.get('stderr','')[:120]}"
+
+    if cancel.get("ok"):
+        cancel_line = "✓ All open orders cancelled"
+    elif cancel.get("error"):
+        cancel_line = f"✗ cancel_all_orders FAILED: {cancel.get('error','')[:120]}"
+    else:
+        cancel_line = "— cancel_all_orders skipped"
+
+    close_lines = []
+    for cr in fire_result.get("close_results", []):
+        mark = "✓" if cr.get("ok") else "✗"
+        line = f"  {mark} {cr.get('coin','?')} (attempts={cr.get('attempts')})"
+        if cr.get("fill_price"):
+            try:
+                line += f" @ ${float(cr['fill_price']):,.4f}"
+            except (TypeError, ValueError):
+                line += f" @ {cr['fill_price']}"
+        if cr.get("note"):
+            line += f" — {cr['note']}"
+        if cr.get("error"):
+            line += f" — ERROR: {cr['error'][:100]}"
+        close_lines.append(line)
+    close_block = "\n".join(close_lines) if close_lines else "  (no open positions at fire-time)"
+
+    flat_line = "✓ All positions flat" if fire_result.get("all_flat") else "✗ Some positions NOT confirmed flat — check Hyperliquid"
+
+    fatal_block = ""
+    if fatal:
+        fatal_block = f"\n🛑 *FATAL:* {fatal}\n"
+
+    return (
+        "🚨 *PASSIVBOT KILL-SWITCH FIRED*\n"
+        f"\n"
+        f"Account value: ${current_value:,.2f}\n"
+        f"Peak: ${peak:,.2f}\n"
+        f"Drawdown: {dd_pct*100:.2f}% (threshold -{DD_THRESHOLD*100:.0f}%)\n"
+        f"Duration: {fire_result.get('duration_s', 0):.1f}s\n"
+        f"{fatal_block}"
+        f"\n"
+        f"{unload_line}\n"
+        f"{cancel_line}\n"
+        f"{flat_line}\n"
+        f"\n"
+        f"*Position closes ({len(fire_result.get('close_results', []))}):*\n"
+        f"{close_block}\n"
+        f"\n"
+        f"⚠️  *Manual reconciliation required.* Steps on Tau:\n"
+        f"1. Verify HL UI shows zero positions.\n"
+        f"2. Investigate the drawdown root cause.\n"
+        f"3. Re-arm breaker: `cd ~/Projects/trading-bots/passivbot && "
+        f"python3 scripts/dd_circuit_reset.py`\n"
+        f"4. Reload Passivbot ONLY after review: "
+        f"`launchctl load ~/Library/LaunchAgents/{PLIST_LABEL}.plist`"
+    )
+
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 def main() -> int:
@@ -361,7 +700,20 @@ def main() -> int:
         default=METRICS_JSON,
         help=f"Daily metrics JSON (default: {METRICS_JSON})",
     )
+    parser.add_argument(
+        "--fire-mode",
+        type=str,
+        default=None,
+        choices=ALLOWED_FIRE_MODES,
+        help=(
+            "Override the fire action. Defaults to DD_FIRE_MODE env var or "
+            f"{DEFAULT_FIRE_MODE!r}. kill_switch: unload plist + cancel orders "
+            "+ market-close. pause_freeze: set entry_initial_qty_pct=0 + "
+            "freeze TWEL (T3-001 original behavior)."
+        ),
+    )
     args = parser.parse_args()
+    fire_mode = resolve_fire_mode(args.fire_mode)
 
     # ---- Load inputs ------------------------------------------------------
     state = load_state(args.state_path)
@@ -388,7 +740,8 @@ def main() -> int:
 
     print(
         f"[dd_circuit_breaker] date={current_date} current=${current_value:.2f} "
-        f"peak=${new_peak:.2f} dd={dd_pct*100:.2f}% fired={bool(state.get('fired_at'))}"
+        f"peak=${new_peak:.2f} dd={dd_pct*100:.2f}% mode={fire_mode} "
+        f"fired={bool(state.get('fired_at'))}"
     )
     print(f"  → {result['reason']}")
 
@@ -400,32 +753,40 @@ def main() -> int:
     # ---- Fire ------------------------------------------------------------
     if should_fire:
         if args.dry_run:
-            print("DRY-RUN: would fire (skipping config write, telegram, state mark)")
+            print(f"DRY-RUN: would fire (mode={fire_mode}; skipping config/api/telegram/state)")
             return 0
 
-        wallet = resolve_wallet()
-        twe, positions = (-1.0, [])
-        if wallet:
-            twe, positions = fetch_current_twe(wallet)
-        else:
-            print("WARN: no wallet resolved; skipping TWE calc", file=sys.stderr)
-
-        diff = modify_live_config(
-            args.config_path,
-            pause_entries=True,
-            freeze_twel=twe if twe >= 0 else None,
-        )
-
-        state["fired_at"] = datetime.now(timezone.utc).isoformat()
+        fired_at = datetime.now(timezone.utc).isoformat()
+        state["fired_at"] = fired_at
         state["fired_reason"] = result["reason"]
         state["fired_current"] = current_value
         state["fired_peak"] = new_peak
         state["fired_dd_pct"] = dd_pct
-        state["fired_twe"] = twe if twe >= 0 else None
-        state["fired_config_diff"] = diff
-        save_state(args.state_path, state)
+        state["fired_mode"] = fire_mode
 
-        alert = format_alert(current_value, new_peak, dd_pct, twe, positions, diff)
+        if fire_mode == "kill_switch":
+            fire_result = kill_switch_fire()
+            state["fired_kill_switch_result"] = fire_result
+            save_state(args.state_path, state)
+            alert = format_kill_switch_alert(current_value, new_peak, dd_pct, fire_result)
+        else:  # pause_freeze (legacy T3-001 behavior)
+            wallet = resolve_wallet()
+            twe, positions = (-1.0, [])
+            if wallet:
+                twe, positions = fetch_current_twe(wallet)
+            else:
+                print("WARN: no wallet resolved; skipping TWE calc", file=sys.stderr)
+
+            diff = modify_live_config(
+                args.config_path,
+                pause_entries=True,
+                freeze_twel=twe if twe >= 0 else None,
+            )
+            state["fired_twe"] = twe if twe >= 0 else None
+            state["fired_config_diff"] = diff
+            save_state(args.state_path, state)
+            alert = format_alert(current_value, new_peak, dd_pct, twe, positions, diff)
+
         send_telegram(alert)
         print(alert)
         return 0
