@@ -235,12 +235,21 @@ def resolve_coin_sources(
 
 
 def _collect_union(values: Iterable[Optional[List[str]]], fallback: List[str]) -> List[str]:
+    """Union of explicit per-scenario coin lists, plus the fallback whenever
+    any scenario opted out (coins=None).
+
+    A scenario with coins=None means "use the user's approved_coins" — it
+    is not a no-op. Without this, a suite that mixes coin-pinned scenarios
+    with default-coin scenarios fetches only the union of the pinned ones,
+    silently filtering the default scenarios down to that smaller set."""
     union: set[str] = set()
+    saw_none = False
     for val in values:
         if not val:
+            saw_none = True
             continue
         union.update(val)
-    if not union:
+    if saw_none or not union:
         union.update(fallback)
     return sorted(union)
 

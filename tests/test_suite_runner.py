@@ -8,6 +8,7 @@ from suite_runner import (
     SuiteScenario,
     ScenarioResult,
     ExchangeDataset,
+    _collect_union,
     aggregate_metrics,
     apply_scenario,
     build_scenarios,
@@ -221,6 +222,37 @@ def test_resolve_coin_sources_merges_overrides():
     overrides = {"ETH": "bybit"}
     resolved = resolve_coin_sources(base, overrides)
     assert resolved == {"BTC": "binance", "ETH": "bybit"}
+
+
+def test_collect_union_all_explicit_no_fallback():
+    """When every value is a non-empty list, fallback isn't used."""
+    assert _collect_union([["BTC", "ETH"], ["SOL"]], ["FAIL_FALLBACK"]) == ["BTC", "ETH", "SOL"]
+
+
+def test_collect_union_all_empty_uses_fallback():
+    """When every value is None/empty, fallback fills the union."""
+    assert _collect_union([None, None], ["BTC", "ETH"]) == ["BTC", "ETH"]
+    assert _collect_union([[], None, []], ["SOL"]) == ["SOL"]
+
+
+def test_collect_union_mixed_explicit_and_none_uses_fallback():
+    """REGRESSION GUARD: a scenario with coins=None means 'use approved_coins
+    for this scenario'. The bug was that _collect_union skipped None values
+    entirely whenever ANY scenario specified coins, silently filtering the
+    default scenarios' coin set down to the union of the pinned ones."""
+    # ['BTC'] pinned + None (= use fallback) → union must include fallback
+    union = _collect_union([["BTC"], None], ["AAVE", "BTC", "ETH"])
+    assert "AAVE" in union and "ETH" in union, (
+        f"None scenario must contribute fallback to union, got {union}"
+    )
+    assert union == ["AAVE", "BTC", "ETH"]
+
+
+def test_collect_union_all_explicit_does_not_pull_fallback():
+    """Negative case: if NO scenario has coins=None, fallback stays out."""
+    union = _collect_union([["BTC"], ["ETH"]], ["FAIL_FALLBACK"])
+    assert "FAIL_FALLBACK" not in union
+    assert union == ["BTC", "ETH"]
 
 
 def test_collect_suite_coin_sources_detects_conflicts():
