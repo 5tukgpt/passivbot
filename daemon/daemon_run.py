@@ -271,6 +271,22 @@ def main():
             logging.info("No cross-regime survivors this run. Daemon completed successfully.")
             # Don't spam Telegram for empty runs — only on hits or failures.
 
+        # Regenerate the static HTML dashboard from the updated DB. Best-effort:
+        # a dashboard build failure must not fail the nightly cycle.
+        dashboard_script = DAEMON_ROOT / "dashboard_builder.py"
+        if dashboard_script.exists():
+            try:
+                rc = subprocess.run(
+                    [str(PYTHON), str(dashboard_script)],
+                    capture_output=True, text=True, timeout=30,
+                ).returncode
+                if rc == 0:
+                    logging.info("Dashboard regenerated at daemon/dashboards/index.html")
+                else:
+                    logging.warning("Dashboard build returned exit %s; ignoring", rc)
+            except Exception as e:
+                logging.warning("Dashboard build skipped: %s", e)
+
         logging.info("======================================================================")
         logging.info("Daemon run %s complete", run_id)
         logging.info("======================================================================")

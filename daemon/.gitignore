@@ -6,3 +6,6 @@ config_optimizer.db-shm
 
 # Per-run log files from daemon_run.py.
 logs/
+
+# Regenerable HTML dashboard output (rebuilt on every daemon run).
+dashboards/
