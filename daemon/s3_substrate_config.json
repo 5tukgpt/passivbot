@@ -260,14 +260,14 @@
       ],
       "long_filter_volatility_drop_pct": [
         0,
-        0
+        1.0
       ],
       "long_filter_volatility_ema_span": [
         10,
         720
       ],
       "long_filter_volume_drop_pct": [
-        0.5,
+        0.0,
         1
       ],
       "long_filter_volume_ema_span": [

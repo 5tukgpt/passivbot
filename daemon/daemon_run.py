@@ -34,9 +34,59 @@ PYTHON = PASSIVBOT_ROOT / "venv/bin/python"
 OPTIMIZE_SCRIPT = PASSIVBOT_ROOT / "src/optimize.py"
 PERSIST_SCRIPT = DAEMON_ROOT / "persist_results.py"
 OOS_VALIDATE_SCRIPT = DAEMON_ROOT / "oos_validate.py"
+HYPERVOLUME_SCRIPT = DAEMON_ROOT / "compute_hypervolume.py"
 DB_PATH = DAEMON_ROOT / "config_optimizer.db"
 LOG_DIR = DAEMON_ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
+
+DAEMON_RUNS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS daemon_runs (
+    run_id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    status TEXT NOT NULL,        -- 'running' | 'success' | 'failed'
+    duration_s REAL,
+    n_substrates INTEGER NOT NULL DEFAULT 0,
+    n_oos_validations INTEGER NOT NULL DEFAULT 0,
+    n_survivors INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    log_path TEXT
+);
+"""
+
+
+def _record_run_start(run_id: str, log_path: Path) -> None:
+    import sqlite3
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.executescript(DAEMON_RUNS_SCHEMA)
+        conn.execute(
+            "INSERT OR REPLACE INTO daemon_runs "
+            "(run_id, started_at, status, log_path) VALUES (?, ?, 'running', ?)",
+            (run_id, datetime.now(timezone.utc).isoformat(), str(log_path)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _record_run_end(run_id: str, status: str, duration_s: float,
+                    n_substrates: int = 0, n_oos: int = 0,
+                    n_survivors: int = 0, error: str | None = None) -> None:
+    import sqlite3
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.executescript(DAEMON_RUNS_SCHEMA)
+        conn.execute(
+            "UPDATE daemon_runs SET finished_at=?, status=?, duration_s=?, "
+            "n_substrates=?, n_oos_validations=?, n_survivors=?, error=? "
+            "WHERE run_id=?",
+            (datetime.now(timezone.utc).isoformat(), status, duration_s,
+             n_substrates, n_oos, n_survivors, error, run_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 SUBSTRATES = [
     {
@@ -201,10 +251,17 @@ def main():
     logging.info("Config Optimizer Daemon — nightly run %s", run_id)
     logging.info("======================================================================")
 
+    t_start = time.time()
+    _record_run_start(run_id, log_path)
+    n_substrates_attempted = 0
+    n_oos_attempted = 0
+    n_survivors_final = 0
+
     try:
         # Phase 1: NSGA2 sweeps on each substrate
         if not args.skip_nsga2:
             for s in SUBSTRATES:
+                n_substrates_attempted += 1
                 rc = run_subprocess(
                     [str(PYTHON), str(OPTIMIZE_SCRIPT), str(s["config"]), "--log-level", "info"],
                     cwd=PASSIVBOT_ROOT,
@@ -224,6 +281,19 @@ def main():
         if rc != 0:
             raise RuntimeError(f"persist_results failed (exit {rc})")
 
+        # Phase 2b: Compute per-generation hypervolume convergence (best-effort).
+        # A failure here doesn't fail the nightly cycle — HV is observability,
+        # not on the promotion path.
+        if HYPERVOLUME_SCRIPT.exists():
+            rc = run_subprocess(
+                [str(PYTHON), str(HYPERVOLUME_SCRIPT), "--all"],
+                cwd=DAEMON_ROOT,
+                log_path=log_path,
+                label="hypervolume",
+            )
+            if rc != 0:
+                logging.warning("hypervolume computation returned exit %d (continuing)", rc)
+
         # Phase 3: Cross-OOS-validate top-N from each substrate
         for s in SUBSTRATES:
             train_run = latest_run_id_for_substrate(s["label"])
@@ -232,6 +302,7 @@ def main():
                 continue
             logging.info("OOS-validating top-%d from %s against %s → %s",
                          args.top_n, train_run, s["val_start"], s["val_end"])
+            n_oos_attempted += 1
             rc = run_subprocess(
                 [str(PYTHON), str(OOS_VALIDATE_SCRIPT),
                  "--training-run", train_run,
@@ -247,6 +318,7 @@ def main():
 
         # Phase 4: Report cross-regime survivors
         survivors = cross_regime_candidates()
+        n_survivors_final = len(survivors)
         logging.info("Cross-regime survivors: %d candidates pass TWE >= %.2f and gain >= %.2f on both substrates",
                      len(survivors), CROSS_REGIME_MIN_TWE, CROSS_REGIME_MIN_GAIN)
 
@@ -290,10 +362,23 @@ def main():
         logging.info("======================================================================")
         logging.info("Daemon run %s complete", run_id)
         logging.info("======================================================================")
+        _record_run_end(
+            run_id, "success", time.time() - t_start,
+            n_substrates=n_substrates_attempted,
+            n_oos=n_oos_attempted,
+            n_survivors=n_survivors_final,
+        )
         return 0
 
     except Exception as exc:
         logging.exception("Daemon run failed: %s", exc)
+        _record_run_end(
+            run_id, "failed", time.time() - t_start,
+            n_substrates=n_substrates_attempted,
+            n_oos=n_oos_attempted,
+            n_survivors=n_survivors_final,
+            error=str(exc),
+        )
         if not args.skip_telegram:
             telegram_send(
                 f"⚠️ *Config Optimizer Daemon FAILED*\n"

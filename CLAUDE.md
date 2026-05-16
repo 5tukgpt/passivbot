@@ -2,11 +2,11 @@
 
 Grid-trading bot running on Hyperliquid perps. Rust computes orders; Python orchestrates exchange I/O. This file is your project context — read it plus `AGENTS.md` before doing anything non-trivial.
 
-## Current status (as of 2026-05-11)
+## Current status (as of 2026-05-16)
 
 - **Exchange:** Hyperliquid. Stake currency USDC.
 - **Mode:** Live (paper-equivalent via small capital). `balance_override: 1146.0` in `configs/live/optimized.json` (updated 2026-05-12 to match live HL spot USDC $1146.37).
-- **Live equity:** ~$1,233 (as of 2026-05-10)
+- **Live equity:** ~$1,258 (as of 2026-05-15)
 - **Approved coins (14):** BTC, ETH, SOL, HYPE, XRP, NEAR, SUI, AAVE, DOGE, AVAX, LINK, ARB, WLD, ENA. Configured in `configs/approved_coins.json` and referenced by `configs/live/optimized.json`.
 - **Leverage:** 10×.
 - **Supervision:** launchd plist (see `../plists/`). Same stop/start discipline as gooner_bot — unload before kill.
