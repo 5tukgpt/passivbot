@@ -60,11 +60,19 @@ from typing import Any
 REPO = Path(__file__).resolve().parent.parent
 TRADING_BOTS_ROOT = REPO.parent
 METRICS_JSON = REPO / "logs" / "hl_daily_metrics.json"
-LIVE_CONFIG = REPO / "configs" / "live" / "optimized.json"
+# v7.11 cutover (2026-05-22): live bot moved from fork-master to a separate
+# repo tree at ~/Projects/passivbot-v7.11/. The fork-master config at
+# REPO/configs/live/optimized.json is now INERT — editing it would have no
+# effect on the running bot. Point at the v7.11 live config that
+# com.tradingbots.passivbot-v7.11-live actually loads. Path verified
+# against `ps` output of the running PID. (T3-001's pause_freeze action
+# was effectively decorative pre-fix; fixed 2026-05-27.)
+V7_11_REPO = TRADING_BOTS_ROOT.parent / "passivbot-v7.11"
+LIVE_CONFIG = V7_11_REPO / "configs" / "v7.11-live" / "optimized.live.json"
 STATE_PATH = REPO / "data" / "dd_circuit_state.json"
 API_KEYS_PATH = REPO / "api-keys.json"
-LIVE_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / "com.tradingbots.passivbot.plist"
-PLIST_LABEL = "com.tradingbots.passivbot"
+LIVE_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / "com.tradingbots.passivbot-v7.11-live.plist"
+PLIST_LABEL = "com.tradingbots.passivbot-v7.11-live"
 
 DD_THRESHOLD = 0.20  # fire at >= 20% drawdown from peak
 INFO_URL = "https://api.hyperliquid.xyz/info"
