@@ -16,7 +16,7 @@ Fire condition: account_value drops >= 20% below the rolling peak.
 Fire-action MODES (configurable via DD_FIRE_MODE env var or --fire-mode):
 
   kill_switch (default, 2026-05-14):
-    1) launchctl unload com.tradingbots.passivbot.plist  (stop new orders)
+    1) launchctl unload com.tradingbots.gooner-bot.plist (stop new orders)
     2) ccxt cancel_all_orders                            (clear the book)
     3) market-close each open position with reduceOnly,  (flatten exposure)
        3 retries with exponential backoff per position
@@ -71,8 +71,11 @@ V7_11_REPO = TRADING_BOTS_ROOT.parent / "passivbot-v7.11"
 LIVE_CONFIG = V7_11_REPO / "configs" / "v7.11-live" / "optimized.live.json"
 STATE_PATH = REPO / "data" / "dd_circuit_state.json"
 API_KEYS_PATH = REPO / "api-keys.json"
-LIVE_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / "com.tradingbots.passivbot-v7.11-live.plist"
-PLIST_LABEL = "com.tradingbots.passivbot-v7.11-live"
+# 2026-09-29: the live bot on this wallet is gooner (freqtrade) since 2026-06-01; passivbot-v7.11-live
+# no longer exists, so kill_switch step 1 unloaded nothing. v2 (paper, dry_run) is deliberately left alone.
+# gooner-heartbeat-watchdog treats a not-loaded job as a deliberate unload and never reloads it.
+LIVE_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / "com.tradingbots.gooner-bot.plist"
+PLIST_LABEL = "com.tradingbots.gooner-bot"
 
 DD_THRESHOLD = 0.20  # fire at >= 20% drawdown from peak
 INFO_URL = "https://api.hyperliquid.xyz/info"
@@ -643,7 +646,7 @@ def format_kill_switch_alert(
         fatal_block = f"\n🛑 *FATAL:* {fatal}\n"
 
     return (
-        "🚨 *PASSIVBOT KILL-SWITCH FIRED*\n"
+        "🚨 *GOONER KILL-SWITCH FIRED*\n"
         f"\n"
         f"Account value: ${current_value:,.2f}\n"
         f"Peak: ${peak:,.2f}\n"
@@ -658,12 +661,12 @@ def format_kill_switch_alert(
         f"*Position closes ({len(fire_result.get('close_results', []))}):*\n"
         f"{close_block}\n"
         f"\n"
-        f"⚠️  *Manual reconciliation required.* Steps on Tau:\n"
+        f"⚠️  *Manual reconciliation required.* Steps on Omega:\n"
         f"1. Verify HL UI shows zero positions.\n"
         f"2. Investigate the drawdown root cause.\n"
         f"3. Re-arm breaker: `cd ~/Projects/trading-bots/passivbot && "
         f"python3 scripts/dd_circuit_reset.py`\n"
-        f"4. Reload Passivbot ONLY after review: "
+        f"4. Reload gooner ONLY after review: "
         f"`launchctl load ~/Library/LaunchAgents/{PLIST_LABEL}.plist`"
     )
 
