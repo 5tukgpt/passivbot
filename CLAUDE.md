@@ -2,15 +2,15 @@
 
 Grid-trading bot running on Hyperliquid perps. Rust computes orders; Python orchestrates exchange I/O. This file is your project context — read it plus `AGENTS.md` before doing anything non-trivial.
 
-## Current status (as of 2026-05-16)
+## Current status (as of 2026-08-23)
 
 - **Exchange:** Hyperliquid. Stake currency USDC.
 - **Mode:** Live (paper-equivalent via small capital). `balance_override: 1146.0` in `configs/live/optimized.json` (updated 2026-05-12 to match live HL spot USDC $1146.37).
-- **Live equity:** ~$1,258 (as of 2026-05-15)
+- **Live equity:** ~$2,223 (as of 2026-08-22)
 - **Approved coins (14):** BTC, ETH, SOL, HYPE, XRP, NEAR, SUI, AAVE, DOGE, AVAX, LINK, ARB, WLD, ENA. Configured in `configs/approved_coins.json` and referenced by `configs/live/optimized.json`.
 - **Leverage:** 10×.
 - **Supervision:** launchd plist (see `../plists/`). Same stop/start discipline as gooner_bot — unload before kill.
-- **Drawdown circuit breaker:** `com.tradingbots.dd-circuit-breaker` runs `scripts/dd_circuit_breaker.py` hourly. Fires at -20% from rolling peak: sets `bot.long.entry_initial_qty_pct=0` and freezes `total_wallet_exposure_limit` to current TWE in `configs/live/optimized.json`. Open positions are NOT closed; unstuck logic still runs. Manual re-enable required: `python3 scripts/dd_circuit_reset.py`. State at `data/dd_circuit_state.json`. Reads cached daily metrics (no normal-path HL API calls). This is a *Tier-3 exception* — the breaker is authorized to autonomously edit the live config per T3-001.
+- **Drawdown circuit breaker:** `com.tradingbots.dd-circuit-breaker` runs `scripts/dd_circuit_breaker.py` hourly (on Omega since 2026-09-29). Fires at -20% from rolling peak in `kill_switch` mode (default since 2026-05-14): unloads **`com.tradingbots.gooner-bot`** (repointed 2026-09-29 — the wallet's live bot; v2 paper untouched), cancels all orders, market-closes every position. The legacy `pause_freeze` mode edits passivbot's config instead and cannot stop gooner. Manual re-enable required: `python3 scripts/dd_circuit_reset.py`. State at `data/dd_circuit_state.json`. Reads cached daily metrics (no normal-path HL API calls). This is a *Tier-3 exception* — the breaker is authorized to autonomously edit the live config per T3-001.
 
 ## Domain concepts
 
