@@ -16,7 +16,7 @@ Fire condition: account_value drops >= 20% below the rolling peak.
 Fire-action MODES (configurable via DD_FIRE_MODE env var or --fire-mode):
 
   kill_switch (default, 2026-05-14):
-    1) launchctl unload com.tradingbots.gooner-bot.plist (stop new orders)
+    1) launchctl unload -w com.tradingbots.gooner-bot.plist (stop new orders; stays off across reboots)
     2) ccxt cancel_all_orders                            (clear the book)
     3) market-close each open position with reduceOnly,  (flatten exposure)
        3 retries with exponential backoff per position
@@ -480,7 +480,7 @@ def kill_switch_fire(
     """Execute the kill-switch sequence and return a structured result.
 
     Sequence:
-      1. launchctl unload <plist>            (stop bot from placing new orders)
+      1. launchctl unload -w <plist>         (stop bot from placing new orders; disabled across reboots)
       2. sleep ~5s for clean exit
       3. ccxt cancel_all_orders              (clear the book)
       4. ccxt fetch_positions                (snapshot what to close)
@@ -503,7 +503,8 @@ def kill_switch_fire(
     if plist_path.exists():
         try:
             r = subprocess.run(
-                ["launchctl", "unload", str(plist_path)],
+                # -w also marks the job disabled, so a reboot/login cannot bring the bot back
+                ["launchctl", "unload", "-w", str(plist_path)],
                 capture_output=True, text=True, timeout=15,
             )
             result["unload"] = {
@@ -667,7 +668,7 @@ def format_kill_switch_alert(
         f"3. Re-arm breaker: `cd ~/Projects/trading-bots/passivbot && "
         f"python3 scripts/dd_circuit_reset.py`\n"
         f"4. Reload gooner ONLY after review: "
-        f"`launchctl load ~/Library/LaunchAgents/{PLIST_LABEL}.plist`"
+        f"`launchctl load -w ~/Library/LaunchAgents/{PLIST_LABEL}.plist` (-w clears the disabled flag)"
     )
 
 
