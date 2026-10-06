@@ -364,19 +364,29 @@ def send_telegram(message: str) -> bool:
         )
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = urllib.parse.urlencode({
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": "true",
-    }).encode()
-    try:
-        req = urllib.request.Request(url, data=data)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read()).get("ok", False)
-    except Exception as e:
-        print(f"WARN: Telegram send failed: {e}", file=sys.stderr)
-        return False
+    # Markdown first; if Telegram rejects the formatting (a 400 "can't parse entities" would silently drop
+    # the one alert that reports a failed kill switch), resend the same text as plain text.
+    for parse_mode in ("Markdown", None):
+        fields = {"chat_id": chat_id, "text": message, "disable_web_page_preview": "true"}
+        if parse_mode:
+            fields["parse_mode"] = parse_mode
+        try:
+            req = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode())
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if json.loads(resp.read()).get("ok", False):
+                    return True
+        except Exception as e:
+            print(f"WARN: Telegram send failed ({parse_mode or 'plain'}): {e}", file=sys.stderr)
+    return False
+
+
+def _md(text: object) -> str:
+    """Escape legacy-Markdown specials in interpolated text (error messages, coins) so an odd underscore
+    or asterisk cannot leave an entity unclosed."""
+    s = str(text)
+    for ch in ("\\", "_", "*", "`", "["):
+        s = s.replace(ch, "\\" + ch)
+    return s
 
 
 def format_alert(
@@ -390,7 +400,7 @@ def format_alert(
     pos_lines = []
     for p in sorted(positions, key=lambda x: -x["notional"])[:10]:
         pos_lines.append(
-            f"  - {p['coin']} {p['side']} notional=${p['notional']:.2f} uPnL=${p['upnl']:+.2f}"
+            f"  - {_md(p['coin'])} {p['side']} notional=${p['notional']:.2f} uPnL=${p['upnl']:+.2f}"
         )
     pos_block = "\n".join(pos_lines) if pos_lines else "  (none)"
 
@@ -652,32 +662,32 @@ def format_kill_switch_alert(
     fatal = fire_result.get("fatal")
 
     if unload.get("skipped"):
-        unload_line = f"⚠️ Plist unload SKIPPED ({unload.get('stderr','')[:80]})"
+        unload_line = f"⚠️ Plist unload SKIPPED ({_md(unload.get('stderr','')[:80])})"
     elif unload.get("ok"):
         unload_line = "✓ Plist unloaded"
     else:
-        unload_line = f"✗ Plist unload FAILED: {unload.get('stderr','')[:120]}"
+        unload_line = f"✗ Plist unload FAILED: {_md(unload.get('stderr','')[:120])}"
 
     if cancel.get("ok"):
         cancel_line = "✓ All open orders cancelled"
     elif cancel.get("error"):
-        cancel_line = f"✗ cancel_all_orders FAILED: {cancel.get('error','')[:120]}"
+        cancel_line = f"✗ cancel\\_all\\_orders FAILED: {_md(cancel.get('error','')[:120])}"
     else:
-        cancel_line = "— cancel_all_orders skipped"
+        cancel_line = "— cancel\\_all\\_orders skipped"
 
     close_lines = []
     for cr in fire_result.get("close_results", []):
         mark = "✓" if cr.get("ok") else "✗"
-        line = f"  {mark} {cr.get('coin','?')} (attempts={cr.get('attempts')})"
+        line = f"  {mark} {_md(cr.get('coin','?'))} (attempts={cr.get('attempts')})"
         if cr.get("fill_price"):
             try:
                 line += f" @ ${float(cr['fill_price']):,.4f}"
             except (TypeError, ValueError):
-                line += f" @ {cr['fill_price']}"
+                line += f" @ {_md(cr['fill_price'])}"
         if cr.get("note"):
-            line += f" — {cr['note']}"
+            line += f" — {_md(cr['note'])}"
         if cr.get("error"):
-            line += f" — ERROR: {cr['error'][:100]}"
+            line += f" — ERROR: {_md(cr['error'][:100])}"
         close_lines.append(line)
     close_block = "\n".join(close_lines) if close_lines else "  (no open positions at fire-time)"
 
@@ -685,7 +695,7 @@ def format_kill_switch_alert(
 
     fatal_block = ""
     if fatal:
-        fatal_block = f"\n🛑 *FATAL:* {fatal}\n"
+        fatal_block = f"\n🛑 *FATAL:* {_md(fatal)}\n"
 
     return (
         "🚨 *GOONER KILL-SWITCH FIRED*\n"

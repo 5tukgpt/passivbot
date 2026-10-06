@@ -379,7 +379,7 @@ def test_format_kill_switch_alert_partial_failure() -> None:
     }
     msg = format_kill_switch_alert(900.0, 1200.0, -0.25, fire_result)
     assert "✗ Some positions NOT confirmed flat" in msg
-    assert "cancel_all_orders FAILED" in msg
+    assert "cancel\\_all\\_orders FAILED" in msg  # escaped for legacy Markdown; renders cancel_all_orders
     assert "notional too small" in msg
     assert "ETH" in msg
     print("  ✓ Partial-failure alert flags each issue")
@@ -649,6 +649,69 @@ def test_main_dryrun_simulated_live_divergence() -> None:
     print("  ✓ dry-run with --simulate-live 1150 reports NOT firing")
 
 
+# --------------------------------------------------------------------------
+# Alert delivery: an error message must not break Telegram's legacy Markdown
+# --------------------------------------------------------------------------
+def _legacy_md_balanced(s: str) -> bool:
+    """Approximates Telegram's legacy Markdown: backslash escapes _*`[, code spans run to the next
+    backtick, and an unclosed _ * or ` entity is a 400 'can't parse entities'."""
+    open_, i = None, 0
+    while i < len(s):
+        c = s[i]
+        if open_ == "`":
+            if c == "`":
+                open_ = None
+        elif c == "\\" and i + 1 < len(s) and s[i + 1] in "_*`[\\":
+            i += 1
+        elif c in "_*`":
+            open_ = None if open_ == c else (c if open_ is None else open_)
+        i += 1
+    return open_ is None
+
+
+def test_kill_switch_alert_with_underscored_errors_stays_parseable() -> None:
+    result = {
+        "unload": {"ok": False, "stderr": "Load failed: 5: Input/output_error", "skipped": False},
+        "cancel_orders": {"ok": False, "error": "ExchangeError: no_open_orders"},
+        "close_results": [{"coin": "kPEPE_X", "ok": False, "attempts": 3, "error": "InvalidOrder: min_notional"}],
+        "all_flat": False, "duration_s": 1.0,
+        "fatal": "hyperliquid_live creds missing/invalid at /x/api-keys.json",
+    }
+    msg = format_kill_switch_alert(900.0, 1200.0, -0.25, result)
+    assert _legacy_md_balanced(msg), msg
+    assert "hyperliquid\\_live" in msg
+    import dd_circuit_breaker as d  # noqa: PLC0415
+    raw = msg.replace("hyperliquid\\_live", "hyperliquid_live")
+    assert not _legacy_md_balanced(raw), "the checker must catch an unescaped odd underscore"
+    assert _legacy_md_balanced(d._md("a_b*c`d[e")), d._md("a_b*c`d[e")
+    print("  ✓ fatal/cancel/close error text is escaped; the alert parses")
+
+
+def test_send_telegram_falls_back_to_plain_text() -> None:
+    import io
+    import urllib.error
+    import urllib.parse as up
+    import dd_circuit_breaker as d  # noqa: PLC0415
+    calls = []
+
+    def fake_urlopen(req, timeout=10):
+        fields = dict(up.parse_qsl(req.data.decode()))
+        calls.append(fields.get("parse_mode"))
+        if fields.get("parse_mode"):
+            raise urllib.error.HTTPError(req.full_url, 400, "Bad Request: can't parse entities", {}, None)
+        return io.BytesIO(b'{"ok": true}')
+
+    saved = (d.urllib.request.urlopen, d._load_telegram_creds)
+    try:
+        d.urllib.request.urlopen = fake_urlopen
+        d._load_telegram_creds = lambda: ("test-token", "123")
+        assert d.send_telegram("broken *markdown") is True
+    finally:
+        d.urllib.request.urlopen, d._load_telegram_creds = saved
+    assert calls == ["Markdown", None], calls
+    print("  ✓ a Markdown 400 is retried as plain text")
+
+
 def main() -> int:
     tests = [
         test_decide_fires_at_25pct,
@@ -686,6 +749,8 @@ def main() -> int:
         test_live_wallet_uses_daily_metrics_resolution,
         test_main_failed_warning_send_retries_next_hour,
         test_main_dryrun_sends_no_warning_and_keeps_state,
+        test_kill_switch_alert_with_underscored_errors_stays_parseable,
+        test_send_telegram_falls_back_to_plain_text,
     ]
     failures = 0
     for test in tests:
