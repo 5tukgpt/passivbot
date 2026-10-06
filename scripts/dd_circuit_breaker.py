@@ -33,8 +33,16 @@ Fire-action MODES (configurable via DD_FIRE_MODE env var or --fire-mode):
 
 Data source: passivbot/logs/hl_daily_metrics.json (refreshed daily 00:05 UTC
 by com.tradingbots.passivbot-metrics). The breaker does NOT poll HL on the
-normal path. HL API calls happen only on fire (kill_switch: many; pause_freeze:
-one read-only for TWE calc).
+normal path. HL API calls happen only when the file says fire: first two
+read-only calls to confirm the drawdown live, then the fire itself
+(kill_switch: many; pause_freeze: one read-only for TWE calc).
+
+Live confirmation (2026-10): the metrics file is a plain file that any
+process running as this user can write, and it can be stale or wrong. The
+breaker fires only if a live read-only Hyperliquid read ALSO breaches the
+threshold against the same peak. A failed or empty live read never fires
+(gooner's own drawdown guard has already stopped entries at -12%); the next
+hourly run retries, and a Telegram warning goes out at most once a day.
 
 Telegram creds: prefer TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID env vars; otherwise
 read from <trading-bots-root>/.telegram-bot-token and .telegram-chat-id files.
@@ -211,6 +219,39 @@ def hl_info(body: dict[str, Any], timeout: int = 15) -> Any:
     req = urllib.request.Request(INFO_URL, data, {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
+
+
+def live_wallet() -> str:
+    """The wallet daily_metrics (the metrics file's producer) reads, so the live
+    check measures the same account the file describes."""
+    try:
+        from daily_metrics import resolve_wallet as metrics_wallet  # noqa: PLC0415
+        return metrics_wallet()
+    except Exception as e:
+        print(f"WARN: daily_metrics.resolve_wallet unavailable ({e}); using the breaker's own",
+              file=sys.stderr)
+        return resolve_wallet()
+
+
+def live_account_value(wallet: str) -> float | None:
+    """TWO read-only HL calls. Unified account value, same formula as
+    daily_metrics.fetch_account_breakdown (spot USDC + perp value - spot hold).
+
+    Returns None on any failure, a missing USDC row, missing fields or a
+    non-positive result. Most of this wallet sits in spot USDC, so a reply
+    without it would read as a huge drawdown and confirm a false fire.
+    """
+    try:
+        perp = hl_info({"type": "clearinghouseState", "user": wallet})
+        perp_value = float(perp["marginSummary"]["accountValue"])
+        time.sleep(0.25)
+        spot = hl_info({"type": "spotClearinghouseState", "user": wallet})
+        usdc = next(b for b in spot["balances"] if b.get("coin") == "USDC")
+        value = float(usdc["total"]) + perp_value - float(usdc["hold"])
+    except Exception as e:  # incl. StopIteration (no USDC row), KeyError, TypeError
+        print(f"WARN: live account value read failed: {type(e).__name__}: {e}", file=sys.stderr)
+        return None
+    return value if value > 0 else None
 
 
 def fetch_current_twe(wallet: str) -> tuple[float, list[dict]]:
@@ -695,6 +736,13 @@ def main() -> int:
         help="Override prior-state peak (testing only).",
     )
     parser.add_argument(
+        "--simulate-live",
+        type=float,
+        default=None,
+        help="Override the live confirmation read (testing only; defaults to "
+             "--simulate-current when that is given).",
+    )
+    parser.add_argument(
         "--state-path",
         type=Path,
         default=STATE_PATH,
@@ -762,6 +810,46 @@ def main() -> int:
     state["current"] = current_value
     state["last_check_utc"] = datetime.now(timezone.utc).isoformat()
 
+    # ---- Confirm live before firing (see module docstring) ----------------
+    live_value: float | None = None
+    live: dict | None = None
+    if should_fire:
+        why = "the live read failed"
+        if args.simulate_live is not None:
+            live_value = float(args.simulate_live)
+        elif args.simulate_current is not None:
+            live_value = current_value  # a simulated run is its own live read
+        else:
+            wallet = live_wallet()
+            if wallet:
+                live_value = live_account_value(wallet)
+            else:
+                why = "no wallet address could be resolved (`HL_WALLET_ADDR` / `api-keys.json`)"
+                print(f"WARN: {why}", file=sys.stderr)
+        if live_value and live_value > 0:
+            live = decide(live_value, {"peak": new_peak, "fired_at": None})
+        if live is None or not live["should_fire"]:
+            should_fire = False
+            if live is not None:
+                why = f"live value is ${live_value:,.2f} ({live['dd_pct']*100:.2f}%)"
+            # the date comes from the untrusted file; keep Telegram Markdown balanced
+            safe_date = str(current_date).translate({ord(c): None for c in "_*`["})
+            note = (f"metrics file says {result['reason']} "
+                    f"(${current_value:,.2f} on {safe_date}) but {why}")
+            print(f"  → NOT firing: {note}")
+            state["unconfirmed_at"] = state["last_check_utc"]
+            state["unconfirmed_reason"] = note
+            today = datetime.now(timezone.utc).date().isoformat()
+            if not args.dry_run and state.get("unconfirmed_alerted_on") != today:
+                if send_telegram(
+                    "⚠️ *Drawdown breaker NOT fired*\n\n"
+                    f"{note}.\n\nCheck `{args.metrics_path.name}`. Retrying hourly; "
+                    "this warning repeats at most once a day."
+                ):
+                    state["unconfirmed_alerted_on"] = today  # a failed send retries next hour
+        else:
+            print(f"  → live check confirms: ${live_value:,.2f} ({live['dd_pct']*100:.2f}%)")
+
     # ---- Fire ------------------------------------------------------------
     if should_fire:
         if args.dry_run:
@@ -775,6 +863,7 @@ def main() -> int:
         state["fired_peak"] = new_peak
         state["fired_dd_pct"] = dd_pct
         state["fired_mode"] = fire_mode
+        state["fired_live_value"] = live_value
 
         if fire_mode == "kill_switch":
             fire_result = kill_switch_fire()
@@ -799,6 +888,7 @@ def main() -> int:
             save_state(args.state_path, state)
             alert = format_alert(current_value, new_peak, dd_pct, twe, positions, diff)
 
+        alert += f"\n\nLive check before firing: ${live_value:,.2f} ({live['dd_pct']*100:.2f}%)"
         send_telegram(alert)
         print(alert)
         return 0

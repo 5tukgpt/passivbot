@@ -440,6 +440,215 @@ def test_main_dryrun_kill_switch_mode() -> None:
     assert live_eqp_after == live_eqp_before, "DRY-RUN MUTATED LIVE CONFIG"
 
 
+# --------------------------------------------------------------------------
+# Live confirmation before firing (2026-10)
+# --------------------------------------------------------------------------
+import dd_circuit_breaker as dcb  # noqa: E402
+
+PERP = {"marginSummary": {"accountValue": "700.0"}, "assetPositions": []}
+SPOT = {"balances": [{"coin": "HYPE", "total": "3", "hold": "0"},
+                     {"coin": "USDC", "total": "2000.0", "hold": "600.0"}]}
+
+
+def _fake_info(perp=PERP, spot=SPOT, calls=None):
+    def info(body, timeout=15):
+        if calls is not None:
+            calls.append(body["type"])
+        return perp if body["type"] == "clearinghouseState" else spot
+    return info
+
+
+def _run_main(argv, info=None, kill_result=None, send_ok=True):
+    """main() in-process with HL, telegram and kill_switch_fire replaced.
+    Returns (rc, telegram_messages, kill_switch_calls, hl_calls)."""
+    sent, kills, calls = [], [], []
+    saved = (dcb.hl_info, dcb.send_telegram, dcb.kill_switch_fire, sys.argv,
+             os.environ.get("HL_WALLET_ADDR"), dcb.time.sleep)
+    try:
+        dcb.hl_info = info or _fake_info(calls=calls)
+        dcb.send_telegram = lambda m: sent.append(m) or send_ok
+        dcb.kill_switch_fire = lambda: kills.append(1) or (kill_result or {"close_results": []})
+        dcb.time.sleep = lambda s: None
+        os.environ["HL_WALLET_ADDR"] = "0x0000000000000000000000000000000000000000"
+        sys.argv = ["dd_circuit_breaker.py", "--fire-mode", "kill_switch"] + argv
+        rc = dcb.main()
+    finally:
+        (dcb.hl_info, dcb.send_telegram, dcb.kill_switch_fire, sys.argv, wallet,
+         dcb.time.sleep) = saved
+        if wallet is None:
+            os.environ.pop("HL_WALLET_ADDR", None)
+        else:
+            os.environ["HL_WALLET_ADDR"] = wallet
+    return rc, sent, kills, calls
+
+
+def _files(tmpdir, values, peak=1200.0):
+    metrics = Path(tmpdir) / "metrics.json"
+    metrics.write_text(json.dumps(
+        [{"date": f"2026-10-0{i+1}", "account_value": v} for i, v in enumerate(values)]))
+    state = Path(tmpdir) / "state.json"
+    state.write_text(json.dumps({"peak": peak, "fired_at": None}))
+    return ["--metrics-path", str(metrics), "--state-path", str(state)], state
+
+
+def test_live_value_formula_matches_daily_metrics() -> None:
+    import daily_metrics  # noqa: PLC0415
+    saved = (daily_metrics.hl_info, dcb.hl_info, dcb.time.sleep)
+    try:
+        daily_metrics.hl_info = dcb.hl_info = _fake_info()
+        dcb.time.sleep = lambda s: None  # same time module as daily_metrics'
+        expected = daily_metrics.fetch_account_breakdown("0xabc")["account_value"]
+        got = dcb.live_account_value("0xabc")
+    finally:
+        daily_metrics.hl_info, dcb.hl_info, dcb.time.sleep = saved
+    assert got == expected == 2100.0, f"live {got} vs daily_metrics {expected}"
+    print("  ✓ live value uses the daily metrics formula (2000 + 700 - 600 = 2100)")
+
+
+def test_live_value_failure_and_empty_return_none() -> None:
+    def boom(body, timeout=15):
+        raise OSError("network down")
+    saved_info, saved_sleep = dcb.hl_info, dcb.time.sleep
+    try:
+        dcb.time.sleep = lambda s: None
+        dcb.hl_info = boom
+        assert dcb.live_account_value("0xabc") is None
+        dcb.hl_info = _fake_info(perp={"marginSummary": {"accountValue": "0"}}, spot={"balances": []})
+        assert dcb.live_account_value("0xabc") is None
+        dcb.hl_info = _fake_info(perp={"error": "bad user"})
+        assert dcb.live_account_value("0xabc") is None
+    finally:
+        dcb.hl_info, dcb.time.sleep = saved_info, saved_sleep
+    print("  ✓ failed, empty and malformed reads return None (never a 100% drawdown)")
+
+
+def test_main_fires_when_live_confirms() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        paths, state_path = _files(tmpdir, [1200.0, 900.0])
+        rc, sent, kills, _ = _run_main(paths, info=_fake_info(
+            perp={"marginSummary": {"accountValue": "300.0"}},
+            spot={"balances": [{"coin": "USDC", "total": "800.0", "hold": "250.0"}]}))  # 850 live
+        state = json.loads(state_path.read_text())
+    assert rc == 0 and len(kills) == 1, f"kill_switch calls: {kills}"
+    assert state.get("fired_at") and state.get("fired_live_value") == 850.0, state
+    assert len(sent) == 1 and "Live check before firing: $850.00" in sent[0], sent
+    print("  ✓ file -25% + live -29% → fires once, alert shows the live value")
+
+
+def test_main_no_fire_when_live_recovered_and_warns_once_a_day() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        paths, state_path = _files(tmpdir, [1200.0, 900.0])  # file says -25%; live is 2100
+        rc, sent, kills, _ = _run_main(paths)
+        state = json.loads(state_path.read_text())
+        assert rc == 0 and kills == [], "must not fire"
+        assert state.get("fired_at") is None, state
+        assert "live value is $2,100.00" in state.get("unconfirmed_reason", ""), state
+        assert len(sent) == 1 and "NOT fired" in sent[0], sent
+        rc, sent2, kills2, _ = _run_main(paths)  # next hour, same day
+    assert kills2 == [] and sent2 == [], f"second run re-warned: {sent2}"
+    print("  ✓ file -25% but live recovered → no fire; one warning per day")
+
+
+def test_main_no_fire_when_live_read_fails() -> None:
+    def boom(body, timeout=15):
+        raise OSError("network down")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        paths, state_path = _files(tmpdir, [1200.0, 900.0])
+        rc, sent, kills, _ = _run_main(paths, info=boom)
+        state = json.loads(state_path.read_text())
+    assert kills == [] and state.get("fired_at") is None, state
+    assert len(sent) == 1 and "live read failed" in sent[0], sent
+    print("  ✓ live read fails → no fire, warning sent")
+
+
+def test_main_normal_path_makes_no_hl_calls() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        paths, _ = _files(tmpdir, [1200.0, 1150.0])  # -4%
+        calls = []
+        rc, sent, kills, _ = _run_main(paths, info=_fake_info(calls=calls))
+    assert calls == [] and sent == [] and kills == [], (calls, sent, kills)
+    print("  ✓ armed, no breach → zero Hyperliquid calls")
+
+
+def test_live_value_rejects_malformed_spot() -> None:
+    shapes = [{"error": "rate limited"}, {}, {"balances": []},
+              {"balances": [{"coin": "USDC", "total": None, "hold": "600"}]},
+              {"balances": [{"coin": "USDC", "total": "2000"}]},
+              {"balances": [{"coin": "HYPE", "total": "3", "hold": "0"}]}]
+    saved_info, saved_sleep = dcb.hl_info, dcb.time.sleep
+    try:
+        dcb.time.sleep = lambda s: None
+        for spot in shapes:
+            dcb.hl_info = _fake_info(spot=spot)
+            got = dcb.live_account_value("0xabc")
+            assert got is None, f"spot {spot} gave {got}, must be None"
+    finally:
+        dcb.hl_info, dcb.time.sleep = saved_info, saved_sleep
+    print("  ✓ a spot reply without a usable USDC row is a failed read, not perp-only value")
+
+
+def test_main_no_fire_on_spot_error_reply() -> None:
+    """The wallet is mostly spot USDC: perp-only would read as -74% and confirm a false fire."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        paths, state_path = _files(tmpdir, [2378.0, 1700.0], peak=2378.0)
+        rc, sent, kills, _ = _run_main(paths, info=_fake_info(
+            perp={"marginSummary": {"accountValue": "614.0"}}, spot={"error": "busy"}))
+        state = json.loads(state_path.read_text())
+    assert kills == [] and state.get("fired_at") is None, (kills, state)
+    assert len(sent) == 1 and "live read failed" in sent[0], sent
+    print("  ✓ spot endpoint error during a file breach → no fire")
+
+
+def test_live_wallet_uses_daily_metrics_resolution() -> None:
+    import daily_metrics  # noqa: PLC0415
+    missing = Path(tempfile.gettempdir()) / "dd-test-no-such-api-keys.json"
+    saved = (daily_metrics.API_KEYS_PATH, dcb.API_KEYS_PATH, os.environ.pop("HL_WALLET_ADDR", None))
+    try:
+        daily_metrics.API_KEYS_PATH = dcb.API_KEYS_PATH = missing
+        assert dcb.resolve_wallet() == "", "precondition: the breaker's own lookup finds nothing"
+        assert dcb.live_wallet() == daily_metrics.DEFAULT_WALLET, "must match the metrics producer"
+    finally:
+        daily_metrics.API_KEYS_PATH, dcb.API_KEYS_PATH, env = saved
+        if env is not None:
+            os.environ["HL_WALLET_ADDR"] = env
+    print("  ✓ live check resolves the wallet exactly as daily_metrics does (incl. its fallback)")
+
+
+def test_main_failed_warning_send_retries_next_hour() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        paths, state_path = _files(tmpdir, [1200.0, 900.0])  # live is 2100: recovered
+        _, sent1, _, _ = _run_main(paths, send_ok=False)
+        state = json.loads(state_path.read_text())
+        assert len(sent1) == 1 and "unconfirmed_alerted_on" not in state, state
+        _, sent2, kills, _ = _run_main(paths)
+    assert kills == [] and len(sent2) == 1, sent2
+    print("  ✓ a failed warning is retried next hour, not marked sent")
+
+
+def test_main_dryrun_sends_no_warning_and_keeps_state() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        paths, state_path = _files(tmpdir, [1200.0, 900.0])
+        before = state_path.read_text()
+        _, sent, kills, _ = _run_main(paths + ["--dry-run"])
+        after = state_path.read_text()
+    assert sent == [] and kills == [] and after == before, (sent, kills)
+    print("  ✓ dry-run divergence: no Telegram, state file untouched")
+
+
+def test_main_dryrun_simulated_live_divergence() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_path = Path(tmpdir) / "state.json"
+        state_path.write_text(json.dumps({"peak": 1200.0, "fired_at": None}))
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "dd_circuit_breaker.py"), "--dry-run",
+             "--simulate-current", "900", "--simulate-peak", "1200", "--simulate-live", "1150",
+             "--state-path", str(state_path)],
+            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert "NOT firing" in result.stdout and "would fire" not in result.stdout, result.stdout
+    print("  ✓ dry-run with --simulate-live 1150 reports NOT firing")
+
+
 def main() -> int:
     tests = [
         test_decide_fires_at_25pct,
@@ -465,6 +674,18 @@ def main() -> int:
         test_format_kill_switch_alert_partial_failure,
         test_format_kill_switch_alert_fatal,
         test_main_dryrun_kill_switch_mode,
+        test_live_value_formula_matches_daily_metrics,
+        test_live_value_failure_and_empty_return_none,
+        test_main_fires_when_live_confirms,
+        test_main_no_fire_when_live_recovered_and_warns_once_a_day,
+        test_main_no_fire_when_live_read_fails,
+        test_main_normal_path_makes_no_hl_calls,
+        test_main_dryrun_simulated_live_divergence,
+        test_live_value_rejects_malformed_spot,
+        test_main_no_fire_on_spot_error_reply,
+        test_live_wallet_uses_daily_metrics_resolution,
+        test_main_failed_warning_send_retries_next_hour,
+        test_main_dryrun_sends_no_warning_and_keeps_state,
     ]
     failures = 0
     for test in tests:
